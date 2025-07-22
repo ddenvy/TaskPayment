@@ -1,0 +1,47 @@
+# .NET Gitignore
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+*.cache
+*.docstates
+
+# Binaries
+bin/
+obj/
+
+# Visual Studio
+.vscode/
+.idea/
+*.sln.ide
+
+# NuGet Packages
+*.nupkg
+packages/
+
+# Other
+Thumbs.db
+Desktop.ini
+
+# User-specific files
+*.rsuser
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build artifacts
+*.o
+*.pyc
+*.pyo
+
+# Test results
+TestResults/
+
+# Logs
+*.log
+
+# Ignore user files
+appsettings.json
+secrets.json
