@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Polly;
@@ -15,6 +17,7 @@ public class PaymentProcessor
     private readonly IExchangeRateService _exchangeRateService;
     private readonly ILogger<PaymentProcessor> _logger;
     private readonly ConcurrentDictionary<string, Transaction> _transactionLog = new();
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _transactionSemaphores = new();
 
     public Transaction GetTransaction(string transactionId)
     {
@@ -40,46 +43,59 @@ public class PaymentProcessor
 
     public async Task<Transaction> ProcessPaymentAsync(PaymentRequest request, string transactionId, Currency? targetCurrency = null)
     {
-        if (_transactionLog.TryGetValue(transactionId, out var existing) && existing.Status == TransactionStatus.Processed)
-        {
-            _logger.LogInformation("Idempotent: Transaction {TransactionId} already processed", transactionId);
-            return existing;
-        }
-
-        var transaction = new Transaction { Id = transactionId, Request = request, Status = TransactionStatus.Pending, Timestamp = DateTime.UtcNow };
-        _transactionLog[transactionId] = transaction;
-
+        // Получаем или создаём семафор для данной транзакции
+        var semaphore = _transactionSemaphores.GetOrAdd(transactionId, _ => new SemaphoreSlim(1, 1));
+        
+        await semaphore.WaitAsync();
         try
         {
-            if (!_validator.Validate(request))
+            // Атомарная проверка и создание транзакции для обеспечения идемпотентности
+            var transaction = _transactionLog.GetOrAdd(transactionId, id => 
+                new Transaction { Id = id, Request = request, Status = TransactionStatus.Pending, Timestamp = DateTime.UtcNow });
+
+            // Если транзакция уже обработана, возвращаем её (идемпотентность)
+            if (transaction.Status == TransactionStatus.Processed || transaction.Status == TransactionStatus.Failed)
             {
-                throw new InvalidOperationException("Validation failed");
+                _logger.LogInformation("Idempotent: Transaction {TransactionId} already in final state: {Status}", transactionId, transaction.Status);
+                return transaction;
             }
 
-            if (targetCurrency.HasValue && targetCurrency != request.Currency)
+            try
             {
-                var rate = await _exchangeRateService.GetExchangeRateAsync(request.Currency, targetCurrency.Value);
-                request.Amount *= rate;
-                request.Currency = targetCurrency.Value;
-                _logger.LogInformation("Converted {OriginalAmount} {OriginalCurrency} to {NewAmount} {NewCurrency}", request.Amount / rate, request.Currency, request.Amount, targetCurrency);
+                if (!_validator.Validate(request))
+                {
+                    throw new InvalidOperationException("Validation failed");
+                }
+
+                if (targetCurrency.HasValue && targetCurrency != request.Currency)
+                {
+                    var rate = await _exchangeRateService.GetExchangeRateAsync(request.Currency, targetCurrency.Value);
+                    request.Amount *= rate;
+                    request.Currency = targetCurrency.Value;
+                    _logger.LogInformation("Converted {OriginalAmount} {OriginalCurrency} to {NewAmount} {NewCurrency}", request.Amount / rate, request.Currency, request.Amount, targetCurrency);
+                }
+
+                var gateway = await _router.SelectOptimalGatewayAsync(request);
+                transaction.GatewayUsed = gateway.Name;
+                transaction.Commission = await gateway.GetCommissionAsync(request.Currency);
+
+                var success = await _retryPolicy.ExecuteAsync(async () => await gateway.ProcessPaymentAsync(request));
+
+                transaction.Status = success ? TransactionStatus.Processed : TransactionStatus.Failed;
+            }
+            catch (Exception ex)
+            {
+                transaction.Status = TransactionStatus.Failed;
+                transaction.ErrorMessage = ex.Message;
+                _logger.LogError(ex, "Payment processing failed for {TransactionId}", transactionId);
             }
 
-            var gateway = await _router.SelectOptimalGatewayAsync(request);
-            transaction.GatewayUsed = gateway.Name;
-            transaction.Commission = await gateway.GetCommissionAsync(request.Currency);
-
-            var success = await _retryPolicy.ExecuteAsync(async () => await gateway.ProcessPaymentAsync(request));
-
-            transaction.Status = success ? TransactionStatus.Processed : TransactionStatus.Failed;
+            return transaction;
         }
-        catch (Exception ex)
+        finally
         {
-            transaction.Status = TransactionStatus.Failed;
-            transaction.ErrorMessage = ex.Message;
-            _logger.LogError(ex, "Payment processing failed for {TransactionId}", transactionId);
+            semaphore.Release();
         }
-
-        return transaction;
     }
 
     public async Task<Transaction> RefundAsync(string transactionId, decimal amount)
@@ -112,6 +128,25 @@ public class PaymentProcessor
         {
             transaction.Status = Enum.TryParse<TransactionStatus>(status, out var newStatus) ? newStatus : transaction.Status;
             _logger.LogInformation("Notification updated {TransactionId} to {Status}", transactionId, transaction.Status);
+        }
+    }
+
+    // Метод для очистки завершённых семафоров (предотвращение утечек памяти)
+    public void CleanupCompletedTransactions()
+    {
+        var completedTransactions = _transactionLog
+            .Where(kvp => kvp.Value.Status == TransactionStatus.Processed || 
+                         kvp.Value.Status == TransactionStatus.Failed || 
+                         kvp.Value.Status == TransactionStatus.Refunded)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+        foreach (var transactionId in completedTransactions)
+        {
+            if (_transactionSemaphores.TryRemove(transactionId, out var semaphore))
+            {
+                semaphore.Dispose();
+            }
         }
     }
 }

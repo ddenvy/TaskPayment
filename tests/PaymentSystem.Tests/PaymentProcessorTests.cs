@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -134,6 +135,35 @@ _routerMock.Setup(r => r.GetGatewayByName("MockGateway")).Returns(_gatewayMock.O
 
         Assert.Equal(TransactionStatus.Processed, result.Status);
         _gatewayMock.Verify(g => g.ProcessPaymentAsync(request), Times.Exactly(3));
+    }
+
+    // Тест на идемпотентность в условиях конкурентного доступа
+    [Fact]
+    public async Task ProcessPaymentAsync_ConcurrentRequests_EnsuresIdempotency()
+    {
+        var request = new PaymentRequest { Amount = 100m, Currency = Currency.USD, SourceAccount = "1234567890", DestinationAccount = "0987654321", Metadata = new System.Collections.Generic.Dictionary<string, string>() };
+        string transactionId = "concurrent-test-id";
+        
+        _validatorMock.Setup(v => v.Validate(request)).Returns(true);
+        _routerMock.Setup(r => r.SelectOptimalGatewayAsync(request)).ReturnsAsync(_gatewayMock.Object);
+        _gatewayMock.Setup(g => g.ProcessPaymentAsync(request)).ReturnsAsync(true);
+        _gatewayMock.Setup(g => g.GetCommissionAsync(Currency.USD)).ReturnsAsync(0.01m);
+
+        // Запускаем несколько одновременных запросов с одним transactionId
+        var tasks = new List<Task<Transaction>>();
+        for (int i = 0; i < 10; i++)
+        {
+            tasks.Add(_processor.ProcessPaymentAsync(request, transactionId));
+        }
+
+        var results = await Task.WhenAll(tasks);
+
+        // Все результаты должны быть одинаковыми (идемпотентность)
+        Assert.All(results, result => Assert.Equal(TransactionStatus.Processed, result.Status));
+        Assert.All(results, result => Assert.Equal(transactionId, result.Id));
+        
+        // Gateway должен быть вызван только один раз, несмотря на 10 запросов
+        _gatewayMock.Verify(g => g.ProcessPaymentAsync(request), Times.Once);
     }
 
     // Boundary cases: max amount, invalid inputs, etc.
